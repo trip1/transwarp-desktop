@@ -9,7 +9,7 @@ build:
 	$(GO) build -trimpath -ldflags '$(LDFLAGS)' -o transwarp .
 
 test:
-	$(GO) vet ./... && $(GO) test -race ./...
+	$(GO) vet ./... && CGO_ENABLED=1 $(GO) test -race ./...
 
 # static linux-amd64 / linux-arm64 tarballs + SHA256SUMS in dist/
 dist:
