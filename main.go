@@ -6,8 +6,8 @@ package main
 import (
 	"context"
 	"errors"
-	"io"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"strings"

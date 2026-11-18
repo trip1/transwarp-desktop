@@ -25,7 +25,18 @@ const (
 	beamMax  = 512 << 20
 )
 
-var hc = &http.Client{Timeout: 60 * time.Second}
+var hc = &http.Client{Timeout: 60 * time.Second, Transport: &http.Transport{DialContext: dialMesh}}
+
+// dialMesh binds the tunnel address as source: the hub authenticates callers by it.
+func dialMesh(ctx context.Context, network, addr string) (net.Conn, error) {
+	d := &net.Dialer{Timeout: 10 * time.Second}
+	if r, err := readState(); err == nil {
+		if ip := net.ParseIP(r.MeshIP); ip != nil {
+			d.LocalAddr = &net.TCPAddr{IP: ip}
+		}
+	}
+	return d.DialContext(ctx, network, addr)
+}
 
 // hubCall does METHOD http://hub:7453PATH with an optional JSON body and returns the 2xx body.
 func hubCall(ctx context.Context, hub, method, path string, body any) ([]byte, error) {

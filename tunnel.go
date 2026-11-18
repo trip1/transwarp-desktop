@@ -324,13 +324,18 @@ func upWG(ctx context.Context, s saved, key []byte, exit string, local []netip.A
 	if err := netlink.LinkSetUp(link); err != nil {
 		return err
 	}
+	var owned []netip.Prefix
 	for _, r := range routes {
-		// never steal a route another interface owns (another VPN, a second tunnel): skip it and say so
+		// never steal a route another interface owns (another VPN, a second tunnel): only our own traffic uses it
 		if err := netlink.RouteAdd(&netlink.Route{LinkIndex: link.Attrs().Index, Dst: ipnet(r), Scope: netlink.SCOPE_LINK}); errors.Is(err, unix.EEXIST) {
-			fmt.Printf("route %s skipped: already routed by another interface\n", r)
+			fmt.Printf("route %s: already routed by %s; only transwarp's own traffic uses %s for it\n", r, routedBy(r), wgIface)
+			owned = append(owned, r)
 		} else if err != nil {
 			return fmt.Errorf("route %s: %w", r, err)
 		}
+	}
+	if err := sourceRoutes(link, c.Address[0].Addr(), owned); err != nil {
+		return fmt.Errorf("source routes: %w", err)
 	}
 	rs := runState{PID: os.Getpid(), Name: s.Name, Kind: s.Kind, Iface: wgIface, MeshIP: c.Address[0].Addr().String(), Exit: "none"}
 	logSkipped(skipped, &rs)
@@ -408,6 +413,45 @@ func logSkipped(skipped []netip.Prefix, rs *runState) {
 	}
 }
 
+// routedBy names the link that already has a main-table route for exactly p, or "".
+func routedBy(p netip.Prefix) string {
+	rs, err := netlink.RouteListFiltered(netlink.FAMILY_ALL, &netlink.Route{Dst: ipnet(p), Table: unix.RT_TABLE_MAIN}, netlink.RT_FILTER_DST|netlink.RT_FILTER_TABLE)
+	if err != nil || len(rs) == 0 {
+		return ""
+	}
+	if l, err := netlink.LinkByIndex(rs[0].LinkIndex); err == nil {
+		return l.Attrs().Name
+	}
+	return "another link"
+}
+
+const srcTable = fwmark + 1
+
+// sourceRoutes keeps prefixes that another link owns reachable for OUR traffic only: "from <src> lookup srcTable"
+// with those prefixes via link. transwarp's own sockets (hub calls, beam) bind src, so they work without taking
+// the route away from the other VPN.
+func sourceRoutes(link netlink.Link, src netip.Addr, prefixes []netip.Prefix) error {
+	if len(prefixes) == 0 {
+		return nil
+	}
+	for _, p := range prefixes {
+		if err := netlink.RouteReplace(&netlink.Route{LinkIndex: link.Attrs().Index, Dst: ipnet(p), Table: srcTable, Scope: netlink.SCOPE_LINK}); err != nil {
+			return err
+		}
+	}
+	r := srcRule(src)
+	if err := netlink.RuleAdd(r); err != nil && !errors.Is(err, unix.EEXIST) {
+		return err
+	}
+	return nil
+}
+
+func srcRule(src netip.Addr) *netlink.Rule {
+	r := netlink.NewRule()
+	r.Src, r.Table, r.Priority = ipnet(netip.PrefixFrom(src, 32)), srcTable, 32000
+	return r
+}
+
 // exitRouting is wg-quick's full tunnel: default route in table fwmark, "not fwmark -> that table", and "main,
 // suppress_prefixlength 0" so LAN and other specific routes keep working. v6 goes into the tunnel too (a sink:
 // the hub has no v6 exit, so nothing leaks).
@@ -456,6 +500,13 @@ func teardown() {
 	for _, fam := range []int{netlink.FAMILY_V4, netlink.FAMILY_V6} {
 		for _, r := range exitRules(fam) {
 			netlink.RuleDel(r) // missing = fine
+		}
+	}
+	if rules, err := netlink.RuleList(netlink.FAMILY_V4); err == nil {
+		for _, r := range rules {
+			if r.Table == srcTable {
+				netlink.RuleDel(&r)
+			}
 		}
 	}
 	for _, n := range []string{wgIface, nebIface} {
@@ -641,6 +692,27 @@ func upNebula(ctx context.Context, s saved, key []byte, exit string, local []net
 	for _, r := range skipped {
 		skip[r.String()] = true
 	}
+	var owned []netip.Prefix
+	for _, r := range all {
+		if dev := routedBy(r); dev != "" && r.Bits() > 0 && !skip[r.String()] {
+			fmt.Printf("route %s: already routed by %s; only transwarp's own traffic uses %s for it\n", r, dev, nebIface)
+			skip[r.String()] = true
+			owned = append(owned, r)
+		}
+	}
+	if n, err := netip.ParsePrefix(p.IP); err == nil {
+		if dev := routedBy(n.Masked()); dev != "" {
+			fmt.Printf("warning: %s is already routed by %s (another Nebula?); %s takes it over while up\n", n.Masked(), dev, nebIface)
+			// Nebula always installs its network route; give the other link its route back afterwards
+			if old, err := netlink.RouteListFiltered(netlink.FAMILY_V4, &netlink.Route{Dst: ipnet(n.Masked()), Table: unix.RT_TABLE_MAIN}, netlink.RT_FILTER_DST|netlink.RT_FILTER_TABLE); err == nil && len(old) > 0 {
+				defer func(r netlink.Route) {
+					if _, err := netlink.LinkByIndex(r.LinkIndex); err == nil {
+						netlink.RouteReplace(&r)
+					}
+				}(old[0])
+			}
+		}
+	}
 	conf, err := nebulaConfig(p, string(key), exitIP, skip)
 	if err != nil {
 		return err
@@ -671,6 +743,11 @@ func upNebula(ctx context.Context, s saved, key []byte, exit string, local []net
 		rs.Expires = *s.ExpiresAt
 	}
 	logSkipped(skipped, &rs)
+	if link, err := netlink.LinkByName(nebIface); err != nil {
+		return err
+	} else if err := sourceRoutes(link, netip.MustParseAddr(ip), owned); err != nil {
+		return fmt.Errorf("source routes: %w", err)
+	}
 	if exitIP != "" {
 		link, err := netlink.LinkByName(nebIface)
 		if err == nil {
@@ -703,7 +780,12 @@ func upNebula(ctx context.Context, s saved, key []byte, exit string, local []net
 		case <-t.C:
 		}
 		rs.Hosts = rs.Hosts[:0]
+		seen := map[uint32]bool{}
 		for _, h := range ctl.ListHostmapHosts(false) {
+			if seen[h.LocalIndex] { // the hostmap lists a host once per vpn address
+				continue
+			}
+			seen[h.LocalIndex] = true
 			nh := nebHost{Remote: h.CurrentRemote.String()}
 			if h.Cert != nil {
 				nh.Name = h.Cert.Name()
