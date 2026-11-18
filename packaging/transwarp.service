@@ -1,0 +1,15 @@
+[Unit]
+Description=Transwarp mesh tunnel (gofire WireGuard/Nebula client)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+# Brings up the only (or named) profile from /etc/transwarp; Nebula renews every 6 h while up.
+# Pick an exit with: ExecStart=/usr/local/bin/transwarp daemon NAME --exit pi-5-1
+ExecStart=/usr/local/bin/transwarp daemon
+Restart=on-failure
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
