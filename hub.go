@@ -243,7 +243,7 @@ func cmdBeamSend(ctx context.Context, file, peer string) error {
 	if err != nil {
 		return err
 	}
-	conn, err := (&net.Dialer{Timeout: 10 * time.Second}).DialContext(ctx, "tcp", net.JoinHostPort(ip, fmt.Sprint(beamPort)))
+	conn, err := dialMesh(ctx, "tcp", net.JoinHostPort(ip, fmt.Sprint(beamPort)))
 	if err != nil {
 		return err
 	}
